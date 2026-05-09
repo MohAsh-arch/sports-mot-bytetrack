@@ -5,6 +5,16 @@
 
 ---
 
+# RTX3060
+## CUDA-enabled PyTorch (WSL2)
+
+If CUDA is not detected, reinstall PyTorch with the CUDA 12.4 wheels:
+
+```bash
+pip uninstall torch torchvision -y
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+```
+
 ## 📋 Table of Contents
 
 - [Overview](#-overview)

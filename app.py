@@ -10,11 +10,35 @@ import cv2
 import tempfile
 import os
 import warnings
+# RTX3060
+import torch
+# OPTIMIZED
+import time
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
+
+# RTX3060
+INFERENCE_WIDTH = 960
+# RTX3060
+BALL_DETECT_EVERY = 2
+# RTX3060
+GPU_VRAM_MB = 6144
+
+# RTX3060
+cuda_available = torch.cuda.is_available()
+# RTX3060
+device = "cuda" if cuda_available else "cpu"
+# RTX3060
+if device == "cuda":
+    torch.backends.cudnn.benchmark = True
+    device_name = torch.cuda.get_device_name(0)
+    vram_used_mb = torch.cuda.memory_allocated(0) / 1024**2
+else:
+    device_name = "CPU"
+    vram_used_mb = 0.0
 
 # Must be first Streamlit command
 st.set_page_config(
@@ -23,9 +47,38 @@ st.set_page_config(
     layout="wide"
 )
 
+# RTX3060
+def _maybe_enable_half(model, device):
+    # RTX3060
+    # Keep model in FP32 and rely on Ultralytics' half flag to avoid dtype issues.
+    if device != "cuda":
+        return False
+    return True
+
+# RTX3060
+def _run_yolo(model, half_flag, **kwargs):
+    try:
+        return model(half=half_flag, **kwargs)[0], half_flag
+    except RuntimeError as exc:
+        if half_flag and ("Half" in str(exc) or "dtype" in str(exc)):
+            model.float()
+            return model(half=False, **kwargs)[0], False
+        raise
+
+# RTX3060
+@st.cache_resource
+def load_models(device):
+    from ultralytics import YOLO
+    player_model = YOLO("yolov8m.pt").to(device)
+    ball_model = YOLO("yolov8x.pt").to(device)
+    player_half = _maybe_enable_half(player_model, device)
+    ball_half = _maybe_enable_half(ball_model, device)
+    return player_model, ball_model, player_half, ball_half
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Session State Initialisation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# RTX3060
 _STATE_KEYS = [
     "tracks_df", "ball_df", "poss_df", "sort_df", "sort_reid_df",
     "frames_run", "fps", "img_w", "img_h", "is_panoramic",
@@ -33,6 +86,7 @@ _STATE_KEYS = [
     "vid_bytes", "vid_filename",
     "analysis_done", "video_path",
     "bt_high_conf",
+    "gpu_peak_mb", "inference_seconds", "avg_fps", "device_name",
 ]
 for _k in _STATE_KEYS:
     if _k not in st.session_state:
@@ -51,15 +105,35 @@ st.markdown("---")
 #  Sidebar Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 st.sidebar.header("⚙️ Configuration")
-max_frames     = st.sidebar.slider("Max frames to process", 30, 500, 100, 10)
+# RTX3060
+st.sidebar.markdown(f"**CUDA available:** {cuda_available}")
+# RTX3060
+if not cuda_available:
+    st.sidebar.warning("CUDA not available — install CUDA-enabled PyTorch (cu124) to use the GPU.")
+# RTX3060
+if device == "cuda":
+    st.sidebar.markdown(f"**Device:** {device_name}")
+    st.sidebar.markdown(f"**VRAM in use:** {vram_used_mb:.0f} MB")
+# RTX3060
+max_frames     = st.sidebar.slider("Max frames to process", 30, 750, 300, 10)
+# RTX3060
+if device == "cuda":
+    st.sidebar.caption("RTX 3060 detected — full 750 frames ~3 min")
 st.sidebar.markdown("---")
 st.sidebar.subheader("Features")
 enable_ball    = st.sidebar.checkbox("🏐 Ball detection", value=True)
+# OPTIMIZED
+ball_detect_every = st.sidebar.slider(
+    "Ball detect interval (frames)", 1, 5, BALL_DETECT_EVERY, 1,
+    help="Run ball detection every N frames; skipped frames use Kalman prediction."
+)
 enable_sort    = st.sidebar.checkbox("📊 SORT comparison", value=True)
 enable_triangle= st.sidebar.checkbox("🔺 Defensive triangle", value=False,
                                      help="Requires homography calibration")
 attacking_team = st.sidebar.selectbox("Attacking team", [0, 1],
                                       format_func=lambda x: f"Team {'A' if x==0 else 'B'}")
+# OPTIMIZED
+st.sidebar.markdown("[GitHub repo](https://github.com/MohAsh-arch/sports-mot-bytetrack)")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  File Upload
@@ -145,16 +219,20 @@ if video_path:
 
         with st.spinner("⏳ Loading ML models (first run takes ~2 min on WSL2)…"):
             # Heavy imports — only executed when user clicks Run
+            # OPTIMIZED
+            import supervision as sv
+            # RTX3060
             from config import (
-                DEVICE, OUTPUT_DIR, VIDEO_OUT_DIR, STATS_OUT_DIR, HEAT_OUT_DIR,
+                OUTPUT_DIR, VIDEO_OUT_DIR, STATS_OUT_DIR, HEAT_OUT_DIR,
                 MAX_FRAMES_PANORAMIC, MAX_FRAMES_BROADCAST,
                 DET_CONF_PANORAMIC, DET_CONF_BROADCAST,
                 BYTETRACK_HIGH_CONF_PANORAMIC, BYTETRACK_HIGH_CONF_BROADCAST,
                 REID_ALPHA, MAX_UPLOAD_MB as _MAX_MB, MAX_VIDEO_MINUTES as _MAX_MIN,
+                DET_IOU,
             )
-            from src.detection import PlayerDetector, detect_video_mode
-            from src.tracking import ByteTrackWrapper, run_tracking_loop, run_sort_baseline
-            from src.ball import run_ball_detection
+            from src.detection import detect_video_mode
+            from src.tracking import ByteTrackWrapper, run_sort_baseline
+            from src.ball import BallKalmanGate
             from src.teams import classify_teams
             from src.possession import compute_possession
             from src.heatmap import generate_team_heatmaps, generate_ball_trajectory, generate_possession_chart
@@ -162,18 +240,17 @@ if video_path:
             from src.evaluation import compare_trackers
             from src.homography import get_homography_hybrid, get_pitch_contour_debug
 
+            # RTX3060
+            player_model, ball_model, player_half, ball_half = load_models(device)
+            # RTX3060
+            if device == "cuda":
+                torch.cuda.reset_peak_memory_stats(0)
+
         fps, img_w, img_h, total_frames, is_panoramic = detect_video_mode(video_path)
         limit_by_minutes = int(MAX_VIDEO_MINUTES * 60 * fps)
         frames_to_run = min(max_frames, total_frames, limit_by_minutes)
-        det_conf      = DET_CONF_PANORAMIC if is_panoramic else DET_CONF_BROADCAST
         bt_high_conf  = BYTETRACK_HIGH_CONF_PANORAMIC if is_panoramic else BYTETRACK_HIGH_CONF_BROADCAST
         vname         = Path(video_path).stem
-
-        st.sidebar.info(
-            f"**Device:** {DEVICE}\n\n"
-            f"**Detection conf:** {det_conf}\n\n"
-            f"**ByteTrack high-conf:** {bt_high_conf}"
-        )
 
         # ── Step 1: Detection + Tracking ──────────
         with st.status("🔍 Step 1/5: Detection & Tracking...", expanded=True) as status:
@@ -185,32 +262,248 @@ if video_path:
                 eta = (total - idx) / (idx / elapsed) if idx > 0 else 0
                 progress.progress(pct, f"Frame {idx}/{total} | ETA: {eta:.0f}s")
 
-            detector  = PlayerDetector(is_panoramic=is_panoramic, device=DEVICE, det_conf=det_conf)
-            tracker   = ByteTrackWrapper(fps=fps, activation_threshold=bt_high_conf)
-            tracks_df, frames_run, _ = run_tracking_loop(
-                video_path, detector, tracker,
-                max_frames=frames_to_run, progress_cb=track_progress)
+            # OPTIMIZED
+            def detect_pitch_bounds(frame):
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                green_lower = np.array([25, 30, 40])
+                green_upper = np.array([95, 255, 255])
+                green_mask = cv2.inRange(hsv, green_lower, green_upper)
+
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
+                green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+
+                contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not contours:
+                    return 0, frame.shape[0], False
+
+                largest = max(contours, key=cv2.contourArea)
+                _, y, _, h = cv2.boundingRect(largest)
+                y_top = max(0, y)
+                y_bot = min(frame.shape[0], y + h)
+                if y_bot - y_top < 10:
+                    return 0, frame.shape[0], False
+                return y_top, y_bot, True
+
+            # OPTIMIZED
+            tracker = ByteTrackWrapper(fps=fps, activation_threshold=bt_high_conf)
+            # OPTIMIZED
+            ball_gate = BallKalmanGate() if enable_ball else None
+            # OPTIMIZED
+            cap = cv2.VideoCapture(str(video_path))
+            tracker.reset(); rows = []; ball_rows = []; idx = 0; t0 = time.time()
+
+            ret, first_frame = cap.read()
+            if not ret:
+                cap.release()
+                st.error("Could not read video frames.")
+                st.stop()
+
+            y_top, y_bot, pitch_ok = detect_pitch_bounds(first_frame)
+            if not pitch_ok:
+                y_top, y_bot = 0, img_h
+            crop_h = max(1, y_bot - y_top)
+            scale = INFERENCE_WIDTH / max(img_w, 1)
+            inf_h = max(1, int(round(crop_h * scale)))
+
+            res_factor = (img_w * img_h) / max(1, (INFERENCE_WIDTH * inf_h))
+            ball_factor = float(ball_detect_every) if enable_ball else 1.0
+            roi_factor = (img_h / crop_h) if pitch_ok else 1.0
+            speedup = res_factor * ball_factor * roi_factor
+
+            # OPTIMIZED
+            st.sidebar.info(
+                f"**Device:** {device}\n\n"
+                f"**Inference resolution:** {INFERENCE_WIDTH}x{inf_h}\n\n"
+                f"**Ball detect interval:** {ball_detect_every}\n\n"
+                f"**Estimated speedup:** {speedup:.1f}x"
+            )
+
+            # RTX3060
+            with torch.inference_mode():
+                while idx < frames_to_run:
+                    if idx == 0:
+                        frame = first_frame
+                    else:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+
+                    if pitch_ok:
+                        crop = frame[y_top:y_bot, :]
+                        if crop.size == 0:
+                            crop = frame
+                    else:
+                        crop = frame
+
+                    infer_frame = cv2.resize(
+                        crop, (INFERENCE_WIDTH, inf_h), interpolation=cv2.INTER_LINEAR
+                    )
+                    # RTX3060
+                    player_results, player_half = _run_yolo(
+                        player_model,
+                        player_half,
+                        source=infer_frame,
+                        conf=0.15,
+                        iou=DET_IOU,
+                        classes=[0],
+                        imgsz=INFERENCE_WIDTH,
+                        batch=1,
+                        device=device,
+                        verbose=False,
+                    )
+
+                    player_boxes_obj = player_results.boxes
+                    if player_boxes_obj is not None and len(player_boxes_obj) > 0:
+                        boxes = player_boxes_obj.xyxy.cpu().numpy()
+                        confs = player_boxes_obj.conf.cpu().numpy()
+                        clss = player_boxes_obj.cls.cpu().numpy().astype(int)
+
+                        boxes[:, [0, 2]] /= scale
+                        boxes[:, [1, 3]] /= scale
+                        if pitch_ok:
+                            boxes[:, [1, 3]] += y_top
+
+                        boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, img_w - 1)
+                        boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, img_h - 1)
+
+                        player_mask = confs >= 0.35
+                        if player_mask.any():
+                            player_dets = sv.Detections(
+                                xyxy=boxes[player_mask].astype(np.float32),
+                                confidence=confs[player_mask].astype(np.float32),
+                                class_id=clss[player_mask].astype(int),
+                            )
+                        else:
+                            player_dets = sv.Detections.empty()
+                    else:
+                        player_dets = sv.Detections.empty()
+
+                    # RTX3060
+                    ball_candidate = None
+                    # RTX3060
+                    if enable_ball and idx % ball_detect_every == 0:
+                        # RTX3060
+                        ball_results, ball_half = _run_yolo(
+                            ball_model,
+                            ball_half,
+                            source=infer_frame,
+                            conf=0.15,
+                            iou=DET_IOU,
+                            classes=[32],
+                            imgsz=640,
+                            batch=1,
+                            device=device,
+                            verbose=False,
+                        )
+                        ball_boxes_obj = ball_results.boxes
+                        if ball_boxes_obj is not None and len(ball_boxes_obj) > 0:
+                            ball_boxes = ball_boxes_obj.xyxy.cpu().numpy()
+                            ball_confs = ball_boxes_obj.conf.cpu().numpy()
+
+                            ball_boxes[:, [0, 2]] /= scale
+                            ball_boxes[:, [1, 3]] /= scale
+                            if pitch_ok:
+                                ball_boxes[:, [1, 3]] += y_top
+
+                            ball_boxes[:, [0, 2]] = np.clip(ball_boxes[:, [0, 2]], 0, img_w - 1)
+                            ball_boxes[:, [1, 3]] = np.clip(ball_boxes[:, [1, 3]], 0, img_h - 1)
+
+                            best_idx = int(np.argmax(ball_confs))
+                            bx = ball_boxes[best_idx]
+                            bc_x = float((bx[0] + bx[2]) / 2)
+                            bc_y = float((bx[1] + bx[3]) / 2)
+                            bc_x = float(np.clip(bc_x, 0, img_w - 1))
+                            bc_y = float(np.clip(bc_y, 0, img_h - 1))
+                            ball_candidate = (bc_x, bc_y, float(ball_confs[best_idx]))
+
+                    tracked = tracker.update(player_dets)
+                    if tracked is not None and len(tracked) > 0:
+                        for i in range(len(tracked)):
+                            x1, y1, x2, y2 = tracked.xyxy[i]
+                            rows.append({"frame": idx, "track_id": int(tracked.tracker_id[i]),
+                                "x1": round(float(x1), 1), "y1": round(float(y1), 1),
+                                "x2": round(float(x2), 1), "y2": round(float(y2), 1),
+                                "cx": round(float((x1 + x2) / 2), 1), "cy": round(float((y1 + y2) / 2), 1),
+                                "conf": round(float(tracked.confidence[i]), 3),
+                                "width": round(float(x2 - x1), 1), "height": round(float(y2 - y1), 1)})
+
+                    if enable_ball:
+                        ball_row = {
+                            "frame": idx,
+                            "cx": float("nan"),
+                            "cy": float("nan"),
+                            "conf": float("nan"),
+                            "is_interpolated": False,
+                        }
+                        if idx % ball_detect_every == 0:
+                            if ball_candidate is not None:
+                                cx, cy, conf = ball_candidate
+                                if ball_gate.update(cx, cy):
+                                    ball_row["cx"] = round(cx, 1)
+                                    ball_row["cy"] = round(cy, 1)
+                                    ball_row["conf"] = round(conf, 3)
+                        else:
+                            pred = ball_gate.get_predicted()
+                            if pred is not None:
+                                px = float(np.clip(pred[0], 0, img_w - 1))
+                                py = float(np.clip(pred[1], 0, img_h - 1))
+                                ball_row["cx"] = round(px, 1)
+                                ball_row["cy"] = round(py, 1)
+                                ball_row["conf"] = 0.0
+                                ball_row["is_interpolated"] = True
+                        ball_rows.append(ball_row)
+
+                    if idx % 5 == 0:
+                        track_progress(idx, frames_to_run, time.time() - t0)
+                    idx += 1
+
+            cap.release()
+            # RTX3060
+            inference_seconds = max(time.time() - t0, 1e-6)
+            # RTX3060
+            avg_fps = (idx / inference_seconds) if inference_seconds > 0 else 0.0
+            # RTX3060
+            gpu_peak_mb = 0.0
+            # RTX3060
+            if device == "cuda":
+                gpu_peak_mb = torch.cuda.max_memory_allocated(0) / 1024**2
+                torch.cuda.empty_cache()
+            tracks_df = pd.DataFrame(rows)
+            if tracks_df.empty:
+                tracks_df = pd.DataFrame(columns=[
+                    "frame", "track_id", "x1", "y1", "x2", "y2",
+                    "cx", "cy", "conf", "width", "height",
+                ])
+            frames_run = idx
+            if enable_ball:
+                ball_df = pd.DataFrame(ball_rows)
+                if ball_df.empty:
+                    ball_df = pd.DataFrame(columns=["frame", "cx", "cy", "conf", "is_interpolated"])
+            else:
+                ball_df = None
 
             progress.progress(1.0, "✅ Tracking complete")
             st.write(f"**{tracks_df['track_id'].nunique()} unique player IDs** across {frames_run} frames")
             status.update(label="✅ Step 1: Detection & Tracking complete", state="complete")
 
         # ── Step 2: Ball Detection ────────────────
-        ball_df = None
+        # OPTIMIZED
         if enable_ball:
             with st.status("🏐 Step 2/5: Ball Detection...", expanded=True) as status:
-                progress2 = st.progress(0)
-                st.write("Using dedicated ball model + Kalman gate filter...")
+                # OPTIMIZED
+                progress2 = st.progress(1.0)
+                st.write("Single-pass detector + Kalman interpolation (from Step 1).")
 
-                def ball_progress(idx, total, elapsed):
-                    progress2.progress(idx / total, f"Frame {idx}/{total}")
-
-                ball_df = run_ball_detection(video_path, frames_run,
-                                             device=DEVICE, is_panoramic=is_panoramic,
-                                             progress_cb=ball_progress)
-                detected = ball_df["conf"].notna().sum()
-                progress2.progress(1.0, "✅ Ball detection complete")
-                st.write(f"**Ball detected in {detected}/{frames_run} frames** ({detected/frames_run*100:.1f}%)")
+                if ball_df is None or ball_df.empty:
+                    st.warning("No ball detections found.")
+                else:
+                    interp_mask = ball_df["is_interpolated"] if "is_interpolated" in ball_df.columns else False
+                    detected_mask = ball_df["conf"].notna() & ~interp_mask
+                    detected = int(detected_mask.sum())
+                    pct = (detected / frames_run * 100) if frames_run > 0 else 0
+                    progress2.progress(1.0, "✅ Ball detection complete")
+                    st.write(f"**Ball detected in {detected}/{frames_run} frames** ({pct:.1f}%)")
                 status.update(label="✅ Step 2: Ball Detection complete", state="complete")
         else:
             st.info("Ball detection skipped.")
@@ -236,8 +529,9 @@ if video_path:
         sort_df = None; sort_reid_df = None; reid_available = False
         if enable_sort:
             with st.status("🔄 Step 5/5: SORT Comparison...", expanded=True) as status:
+                # OPTIMIZED
                 sort_df, sort_reid_df, reid_available = run_sort_baseline(
-                    tracks_df, frames_run, video_path=video_path, device=DEVICE)
+                    tracks_df, frames_run, video_path=video_path, device=device)
                 n_bt   = tracks_df['track_id'].nunique()
                 n_sort = sort_df['track_id'].nunique()
                 label  = f"ByteTrack: {n_bt} IDs | SORT: {n_sort} IDs"
@@ -254,6 +548,7 @@ if video_path:
         if sort_reid_df is not None: sort_reid_df.to_csv(STATS_OUT_DIR / f"{vname}_sort_reid.csv", index=False)
 
         # ── Persist to session_state ──────────────
+        # RTX3060
         st.session_state.update({
             "tracks_df":     tracks_df,
             "ball_df":       ball_df,
@@ -271,6 +566,10 @@ if video_path:
             "reid_available":reid_available,
             "video_path":    video_path,
             "bt_high_conf":  bt_high_conf,
+            "gpu_peak_mb":   gpu_peak_mb,
+            "inference_seconds": inference_seconds,
+            "avg_fps":       avg_fps,
+            "device_name":   device_name,
             "analysis_done": True,
         })
 
@@ -300,9 +599,27 @@ if st.session_state.get("analysis_done"):
     reid_available= st.session_state["reid_available"]
     _video_path   = st.session_state.get("video_path", "")
     _bt_high_conf = st.session_state.get("bt_high_conf", 0.45)
+    # RTX3060
+    gpu_peak_mb = st.session_state.get("gpu_peak_mb")
+    # RTX3060
+    inference_seconds = st.session_state.get("inference_seconds")
+    # RTX3060
+    avg_fps = st.session_state.get("avg_fps")
+    # RTX3060
+    device_name_state = st.session_state.get("device_name", device_name)
 
     if video_path is None:
         st.markdown("---")
+
+    # RTX3060
+    if device == "cuda" and gpu_peak_mb is not None and inference_seconds is not None and avg_fps is not None:
+        device_label = "RTX 3060" if "RTX 3060" in device_name_state else device_name_state
+        st.sidebar.info(
+            f"**Device:** {device_label}\n\n"
+            f"**Peak VRAM used:** {gpu_peak_mb:.0f} MB / {GPU_VRAM_MB} MB\n\n"
+            f"**Total inference time:** {inference_seconds:.1f} seconds\n\n"
+            f"**Average FPS:** {avg_fps:.1f} frames/sec"
+        )
 
     st.success("✅ Analysis results ready.")
     st.markdown("---")
@@ -331,9 +648,12 @@ if st.session_state.get("analysis_done"):
                     cv2.putText(ann, f"#{tid}", (x1,max(12,y1-4)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
                 if ball_df is not None:
                     br = ball_df[ball_df["frame"] == frame_num]
+                    # OPTIMIZED
                     if not br.empty and not np.isnan(br.iloc[0]["cx"]):
-                        bx,by = int(br.iloc[0]["cx"]), int(br.iloc[0]["cy"])
-                        cv2.circle(ann, (bx,by), 14, (0,255,0), 3)
+                        bx, by = int(br.iloc[0]["cx"]), int(br.iloc[0]["cy"])
+                        is_interp = bool(br.iloc[0]["is_interpolated"]) if "is_interpolated" in br.columns else False
+                        color = (160, 160, 160) if is_interp else (0, 255, 0)
+                        cv2.circle(ann, (bx, by), 14, color, 3)
                 st.image(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB),
                          caption=f"Frame {frame_num}", use_container_width=True)
 
@@ -373,8 +693,9 @@ if st.session_state.get("analysis_done"):
                         from src.homography import get_homography_hybrid
                         from src.video import render_annotated_video
                         H, H_inv  = get_homography_hybrid(_video_path)
+                        # OPTIMIZED
                         vid_path  = render_annotated_video(
-                            _video_path, tracks_df, ball_df or pd.DataFrame(),
+                            _video_path, tracks_df, (ball_df if ball_df is not None else pd.DataFrame()),
                             poss_df, frames_run, _fps, vname,
                             H, H_inv, attacking_team, enable_triangle)
                         with open(vid_path, "rb") as vf:
