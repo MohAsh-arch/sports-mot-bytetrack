@@ -1,0 +1,35 @@
+# ─────────────────────────────────────────────
+# SportsMOT Local App — Dependencies
+# ─────────────────────────────────────────────
+# Install:  pip install -r requirements.txt
+# ─────────────────────────────────────────────
+
+# Core ML / CV
+ultralytics>=8.0
+supervision>=0.19
+torch
+torchvision
+
+# Detection helpers
+sahi>=0.11
+
+# Tracking / filtering
+filterpy
+lapjv
+scipy
+
+# Data / analysis
+numpy
+pandas
+scikit-learn
+
+# Visualization
+matplotlib
+imageio[ffmpeg]
+
+# Web app
+streamlit
+python-dotenv
+
+# Video
+opencv-python-headless
