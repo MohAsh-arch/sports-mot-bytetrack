@@ -1,6 +1,17 @@
 [server]
 headless = true
 port = 8501
+# Raise upload limit to match app's own 800 MB cap
+maxUploadSize = 800
+# Allow larger websocket payloads (video frames)
+maxMessageSize = 800
 
 [browser]
 gatherUsageStats = false
+
+[runner]
+# Don't keep stale cache on restart
+fastReruns = false
+
+[theme]
+base = "dark"

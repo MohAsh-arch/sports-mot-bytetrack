@@ -13,14 +13,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 def compute_mot_metrics(tracks_df, gt_file, frames_to_run, label="Tracker"):
     """
     Compute proxy MOT metrics by comparing tracker output to GT.
-    GT format: frame, id, x, y, w, h, conf, cls, vis
+
+    Supports two GT formats (auto-detected by column count):
+      • Standard MOT (9 cols):  frame,id,x,y,w,h,conf,cls,vis
+      • TeamTrack   (10 cols):  frame,id,x,y,w,h,conf,x_world,y_world,z_world
     """
     gt_path = Path(gt_file) if gt_file else None
     if not gt_path or not gt_path.is_file():
         return None
 
-    gt = pd.read_csv(gt_path, header=None,
-                     names=["frame","id","x","y","w","h","conf","cls","vis"])
+    # Peek at the first data row to count columns
+    with open(gt_path) as _f:
+        _first = _f.readline().strip()
+    _ncols = len(_first.split(","))
+
+    if _ncols >= 10:
+        # TeamTrack format (10+ columns)
+        _names = ["frame","id","x","y","w","h","conf","x_world","y_world","z_world"]
+    else:
+        # Standard MOT format (9 columns)
+        _names = ["frame","id","x","y","w","h","conf","cls","vis"]
+
+    gt = pd.read_csv(gt_path, header=None, names=_names[:_ncols])
     gt = gt[gt["conf"]==1].copy()
     gt["x2"] = gt["x"]+gt["w"]; gt["y2"] = gt["y"]+gt["h"]
     gt["cx"] = gt["x"]+gt["w"]/2; gt["cy"] = gt["y"]+gt["h"]/2

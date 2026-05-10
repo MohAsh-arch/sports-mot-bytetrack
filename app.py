@@ -20,12 +20,13 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
-# RTX3060
-INFERENCE_WIDTH = 960
+# RTX3060 — 640 keeps both models in 6 GB VRAM simultaneously
+INFERENCE_WIDTH = 640
 # RTX3060
 BALL_DETECT_EVERY = 2
 # RTX3060
 GPU_VRAM_MB = 6144
+MAX_RENDER_DOWNLOAD_MB = 200
 
 # RTX3060
 cuda_available = torch.cuda.is_available()
@@ -65,15 +66,88 @@ def _run_yolo(model, half_flag, **kwargs):
             return model(half=False, **kwargs)[0], False
         raise
 
-# RTX3060
+# RTX3060 — cache_resource keeps models resident; half-precision saves ~50% VRAM
 @st.cache_resource
 def load_models(device):
+    """Load player model + ball model (dedicated fine-tuned if available, else COCO fallback).
+    Returns (player_model, ball_model, player_half, ball_half, ball_class_id, ball_conf, ball_dedicated).
+    """
+    import torch, urllib.request
     from ultralytics import YOLO
+    from config import (
+        BALL_MODEL_URL, BALL_MODEL_PATH, BALL_CONF, BALL_CONF_DEDICATED, BALL_COCO_CLASS_ID
+    )
+
     player_model = YOLO("yolov8m.pt").to(device)
-    ball_model = YOLO("yolov8x.pt").to(device)
+
+    # ── Gap 1: try dedicated fine-tuned football-ball-detection.pt ──────────────
+    ball_dedicated = False
+    if not BALL_MODEL_PATH.exists():
+        try:
+            BALL_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(BALL_MODEL_URL, str(BALL_MODEL_PATH))
+            ball_dedicated = True
+        except Exception as _e:
+            print(f"Ball model download failed ({_e}), using COCO fallback")
+    else:
+        ball_dedicated = True
+
+    if ball_dedicated and BALL_MODEL_PATH.exists():
+        ball_model    = YOLO(str(BALL_MODEL_PATH)).to(device)
+        ball_class_id = 0               # dedicated model: single class 0 = ball
+        ball_conf     = BALL_CONF_DEDICATED
+    else:
+        ball_model    = YOLO("yolov8x.pt").to(device)
+        ball_class_id = BALL_COCO_CLASS_ID  # COCO class 32 = sports ball
+        ball_conf     = BALL_CONF
+
+    if device == "cuda":
+        player_model.model.half()
+        ball_model.model.half()
+        torch.cuda.empty_cache()
+
     player_half = _maybe_enable_half(player_model, device)
-    ball_half = _maybe_enable_half(ball_model, device)
-    return player_model, ball_model, player_half, ball_half
+    ball_half   = _maybe_enable_half(ball_model, device)
+    return player_model, ball_model, player_half, ball_half, ball_class_id, ball_conf, ball_dedicated
+
+
+@st.cache_resource
+def load_sahi_player(device):
+    """Gap 2: SAHI AutoDetectionModel for panoramic player detection.
+    Returns the sahi model or None if sahi is unavailable.
+    """
+    try:
+        from sahi import AutoDetectionModel
+        from config import DET_CONF_PANORAMIC, SAHI_SLICE_W, SAHI_SLICE_H, SAHI_OVERLAP
+        sahi_model = AutoDetectionModel.from_pretrained(
+            model_type="ultralytics",
+            model_path="yolov8m.pt",
+            confidence_threshold=DET_CONF_PANORAMIC,
+            device=device,
+        )
+        return sahi_model
+    except Exception as _e:
+        print(f"SAHI not available for panoramic detection: {_e}")
+        return None
+
+
+@st.cache_resource
+def load_sahi_ball(device, ball_model_path_str, ball_conf):
+    """Gap 1+2: SAHI wrapper for ball detection (helps find small balls in panoramic).
+    Returns sahi model or None.
+    """
+    try:
+        from sahi import AutoDetectionModel
+        sahi_ball = AutoDetectionModel.from_pretrained(
+            model_type="ultralytics",
+            model_path=ball_model_path_str,
+            confidence_threshold=ball_conf,
+            device=device,
+        )
+        return sahi_ball
+    except Exception as _e:
+        print(f"SAHI for ball not available: {_e}")
+        return None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Session State Initialisation
@@ -83,7 +157,7 @@ _STATE_KEYS = [
     "tracks_df", "ball_df", "poss_df", "sort_df", "sort_reid_df",
     "frames_run", "fps", "img_w", "img_h", "is_panoramic",
     "vname", "a_pct", "b_pct", "reid_available",
-    "vid_bytes", "vid_filename",
+    "rendered_video_path", "rendered_video_name",
     "analysis_done", "video_path",
     "bt_high_conf",
     "gpu_peak_mb", "inference_seconds", "avg_fps", "device_name",
@@ -91,6 +165,9 @@ _STATE_KEYS = [
 for _k in _STATE_KEYS:
     if _k not in st.session_state:
         st.session_state[_k] = None
+for _legacy in ("vid_bytes", "vid_filename"):
+    if _legacy in st.session_state:
+        st.session_state.pop(_legacy, None)
 if not st.session_state.get("analysis_done"):
     st.session_state["analysis_done"] = False
 
@@ -115,10 +192,10 @@ if device == "cuda":
     st.sidebar.markdown(f"**Device:** {device_name}")
     st.sidebar.markdown(f"**VRAM in use:** {vram_used_mb:.0f} MB")
 # RTX3060
-max_frames     = st.sidebar.slider("Max frames to process", 30, 750, 300, 10)
+max_frames     = st.sidebar.slider("Max frames to process", 30, 750, 200, 10)
 # RTX3060
 if device == "cuda":
-    st.sidebar.caption("RTX 3060 detected — full 750 frames ~3 min")
+    st.sidebar.caption("RTX 3060 detected — 200 frames safe default (≈1 min)")
 st.sidebar.markdown("---")
 st.sidebar.subheader("Features")
 enable_ball    = st.sidebar.checkbox("🏐 Ball detection", value=True)
@@ -134,6 +211,40 @@ attacking_team = st.sidebar.selectbox("Attacking team", [0, 1],
                                       format_func=lambda x: f"Team {'A' if x==0 else 'B'}")
 # OPTIMIZED
 st.sidebar.markdown("[GitHub repo](https://github.com/MohAsh-arch/sports-mot-bytetrack)")
+
+# ── Gap 4: Ground-truth file for real MOTA / IDF1 metrics ─────────────────────
+st.sidebar.markdown("---")
+st.sidebar.subheader("📋 Ground Truth (optional)")
+st.sidebar.caption("Upload MOT-format GT file to compute MOTA/IDF1 in the Comparison tab.")
+_gt_uploaded = st.sidebar.file_uploader(
+    "GT annotation file (.txt)", type=["txt", "csv"],
+    help="MOT format: frame,id,x,y,w,h,conf,cls,vis",
+    key="gt_file_uploader",
+)
+_gt_path = None
+if _gt_uploaded is not None:
+    _gt_tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
+    _gt_tmp.write(_gt_uploaded.read()); _gt_tmp.close()
+    _gt_path = _gt_tmp.name
+    st.sidebar.success(f"GT loaded: {_gt_uploaded.name}")
+
+# ── New Analysis button ────────────────────────
+st.sidebar.markdown("---")
+if st.sidebar.button("🆕 New Analysis", use_container_width=True,
+                     help="Clear all results and start fresh with a new video"):
+    # Wipe every tracked key so the app returns to its initial state
+    for _k in _STATE_KEYS:
+        st.session_state[_k] = None
+    st.session_state["analysis_done"] = False
+    # Clean up any leftover temp video file
+    _old_path = st.session_state.get("video_path")
+    if _old_path and os.path.exists(str(_old_path)):
+        try:
+            os.unlink(_old_path)
+        except OSError:
+            pass
+    st.rerun()
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  File Upload
@@ -240,9 +351,11 @@ if video_path:
             from src.evaluation import compare_trackers
             from src.homography import get_homography_hybrid, get_pitch_contour_debug
 
-            # RTX3060
-            player_model, ball_model, player_half, ball_half = load_models(device)
-            # RTX3060
+            # RTX3060 + Gap 1: dedicated ball model if available
+            (
+                player_model, ball_model, player_half, ball_half,
+                ball_class_id, ball_conf, ball_dedicated
+            ) = load_models(device)
             if device == "cuda":
                 torch.cuda.reset_peak_memory_stats(0)
 
@@ -252,10 +365,23 @@ if video_path:
         bt_high_conf  = BYTETRACK_HIGH_CONF_PANORAMIC if is_panoramic else BYTETRACK_HIGH_CONF_BROADCAST
         vname         = Path(video_path).stem
 
+        # ── Gap 2: load SAHI models ─────────────────────────
+        _sahi_player = None
+        _sahi_ball   = None
+        with st.spinner("🔭 Loading SAHI models (always used for ball detection to improve accuracy)..."):
+            from config import SAHI_SLICE_H, SAHI_SLICE_W, SAHI_OVERLAP, BALL_SAHI_SLICE, BALL_SAHI_OVERLAP
+            _ball_path   = str(BALL_MODEL_PATH) if ball_dedicated else "yolov8x.pt"
+            _sahi_ball   = load_sahi_ball(device, _ball_path, ball_conf)
+            if is_panoramic:
+                _sahi_player = load_sahi_player(device)
+                st.sidebar.info(f"🔭 Panoramic mode: Player SAHI {'✅' if _sahi_player else '❌'}")
+
         # ── Step 1: Detection + Tracking ──────────
+        _ball_label = f"dedicated ({ball_conf:.2f})" if ball_dedicated else f"COCO class 32 ({ball_conf:.2f})"
         with st.status("🔍 Step 1/5: Detection & Tracking...", expanded=True) as status:
             progress = st.progress(0)
-            st.write(f"Processing {frames_to_run} frames with ByteTrack (threshold={bt_high_conf})...")
+            st.write(f"Processing {frames_to_run} frames | ByteTrack thresh={bt_high_conf} | "
+                     f"Ball model: {_ball_label} | Panoramic={is_panoramic}")
 
             def track_progress(idx, total, elapsed):
                 pct = idx / total
@@ -311,9 +437,10 @@ if video_path:
             roi_factor = (img_h / crop_h) if pitch_ok else 1.0
             speedup = res_factor * ball_factor * roi_factor
 
-            # OPTIMIZED
+            _mode_label = "Panoramic+SAHI" if (is_panoramic and _sahi_player) else ("Panoramic (no SAHI)" if is_panoramic else "Broadcast")
             st.sidebar.info(
                 f"**Device:** {device}\n\n"
+                f"**Mode:** {_mode_label}\n\n"
                 f"**Inference resolution:** {INFERENCE_WIDTH}x{inf_h}\n\n"
                 f"**Ball detect interval:** {ball_detect_every}\n\n"
                 f"**Estimated speedup:** {speedup:.1f}x"
@@ -336,86 +463,150 @@ if video_path:
                     else:
                         crop = frame
 
-                    infer_frame = cv2.resize(
-                        crop, (INFERENCE_WIDTH, inf_h), interpolation=cv2.INTER_LINEAR
-                    )
-                    # RTX3060
-                    player_results, player_half = _run_yolo(
-                        player_model,
-                        player_half,
-                        source=infer_frame,
-                        conf=0.15,
-                        iou=DET_IOU,
-                        classes=[0],
-                        imgsz=INFERENCE_WIDTH,
-                        batch=1,
-                        device=device,
-                        verbose=False,
-                    )
-
-                    player_boxes_obj = player_results.boxes
-                    if player_boxes_obj is not None and len(player_boxes_obj) > 0:
-                        boxes = player_boxes_obj.xyxy.cpu().numpy()
-                        confs = player_boxes_obj.conf.cpu().numpy()
-                        clss = player_boxes_obj.cls.cpu().numpy().astype(int)
-
-                        boxes[:, [0, 2]] /= scale
-                        boxes[:, [1, 3]] /= scale
-                        if pitch_ok:
-                            boxes[:, [1, 3]] += y_top
-
-                        boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, img_w - 1)
-                        boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, img_h - 1)
-
-                        player_mask = confs >= 0.35
-                        if player_mask.any():
+                    # ── Gap 2: SAHI slicing for panoramic, direct resize for broadcast ─
+                    if is_panoramic and _sahi_player is not None:
+                        # SAHI slices the crop into 540×540 tiles — finds small/far players
+                        from sahi.predict import get_sliced_prediction
+                        _sahi_result = get_sliced_prediction(
+                            crop,
+                            _sahi_player,
+                            slice_height=SAHI_SLICE_H,
+                            slice_width=SAHI_SLICE_W,
+                            overlap_height_ratio=SAHI_OVERLAP,
+                            overlap_width_ratio=SAHI_OVERLAP,
+                            verbose=0,
+                        )
+                        _boxes, _confs, _clss = [], [], []
+                        for _obj in _sahi_result.object_prediction_list:
+                            if _obj.category.name.lower() != "person":
+                                continue
+                            if _obj.score.value < DET_CONF_PANORAMIC:
+                                continue
+                            _b = _obj.bbox
+                            # crop coords → add y_top to get full-frame y
+                            _y1c = _b.miny + (y_top if pitch_ok else 0)
+                            _y2c = _b.maxy + (y_top if pitch_ok else 0)
+                            _boxes.append([_b.minx, _y1c, _b.maxx, _y2c])
+                            _confs.append(_obj.score.value)
+                            _clss.append(0)
+                        if _boxes:
+                            _ba = np.array(_boxes, dtype=np.float32)
+                            _ba[:, [0, 2]] = np.clip(_ba[:, [0, 2]], 0, img_w - 1)
+                            _ba[:, [1, 3]] = np.clip(_ba[:, [1, 3]], 0, img_h - 1)
                             player_dets = sv.Detections(
-                                xyxy=boxes[player_mask].astype(np.float32),
-                                confidence=confs[player_mask].astype(np.float32),
-                                class_id=clss[player_mask].astype(int),
+                                xyxy=_ba,
+                                confidence=np.array(_confs, dtype=np.float32),
+                                class_id=np.array(_clss, dtype=int),
                             )
                         else:
                             player_dets = sv.Detections.empty()
+                        infer_frame = crop  # keep ref for ball detection below
                     else:
-                        player_dets = sv.Detections.empty()
-
-                    # RTX3060
-                    ball_candidate = None
-                    # RTX3060
-                    if enable_ball and idx % ball_detect_every == 0:
-                        # RTX3060
-                        ball_results, ball_half = _run_yolo(
-                            ball_model,
-                            ball_half,
+                        # Broadcast mode: resize + direct YOLO (GPU-optimised)
+                        infer_frame = cv2.resize(
+                            crop, (INFERENCE_WIDTH, inf_h), interpolation=cv2.INTER_LINEAR
+                        )
+                        _imgsz = max(32, (INFERENCE_WIDTH // 32) * 32)
+                        player_results, player_half = _run_yolo(
+                            player_model,
+                            player_half,
                             source=infer_frame,
-                            conf=0.15,
+                            conf=DET_CONF_BROADCAST,
                             iou=DET_IOU,
-                            classes=[32],
-                            imgsz=640,
+                            classes=[0],
+                            imgsz=_imgsz,
                             batch=1,
                             device=device,
                             verbose=False,
                         )
-                        ball_boxes_obj = ball_results.boxes
-                        if ball_boxes_obj is not None and len(ball_boxes_obj) > 0:
-                            ball_boxes = ball_boxes_obj.xyxy.cpu().numpy()
-                            ball_confs = ball_boxes_obj.conf.cpu().numpy()
-
-                            ball_boxes[:, [0, 2]] /= scale
-                            ball_boxes[:, [1, 3]] /= scale
+                        player_boxes_obj = player_results.boxes
+                        if player_boxes_obj is not None and len(player_boxes_obj) > 0:
+                            boxes = player_boxes_obj.xyxy.cpu().numpy()
+                            confs = player_boxes_obj.conf.cpu().numpy()
+                            clss  = player_boxes_obj.cls.cpu().numpy().astype(int)
+                            boxes[:, [0, 2]] /= scale
+                            boxes[:, [1, 3]] /= scale
                             if pitch_ok:
-                                ball_boxes[:, [1, 3]] += y_top
+                                boxes[:, [1, 3]] += y_top
+                            boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, img_w - 1)
+                            boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, img_h - 1)
+                            player_mask = confs >= 0.35
+                            if player_mask.any():
+                                player_dets = sv.Detections(
+                                    xyxy=boxes[player_mask].astype(np.float32),
+                                    confidence=confs[player_mask].astype(np.float32),
+                                    class_id=clss[player_mask].astype(int),
+                                )
+                            else:
+                                player_dets = sv.Detections.empty()
+                        else:
+                            player_dets = sv.Detections.empty()
 
-                            ball_boxes[:, [0, 2]] = np.clip(ball_boxes[:, [0, 2]], 0, img_w - 1)
-                            ball_boxes[:, [1, 3]] = np.clip(ball_boxes[:, [1, 3]], 0, img_h - 1)
-
-                            best_idx = int(np.argmax(ball_confs))
-                            bx = ball_boxes[best_idx]
-                            bc_x = float((bx[0] + bx[2]) / 2)
-                            bc_y = float((bx[1] + bx[3]) / 2)
-                            bc_x = float(np.clip(bc_x, 0, img_w - 1))
-                            bc_y = float(np.clip(bc_y, 0, img_h - 1))
-                            ball_candidate = (bc_x, bc_y, float(ball_confs[best_idx]))
+                    # ── Gap 1: ball detection using dedicated model + correct class/conf ─
+                    ball_candidate = None
+                    if enable_ball and idx % ball_detect_every == 0:
+                        if _sahi_ball is not None:
+                            # Use SAHI slicing for small ball in ALL footage (panoramic and broadcast)
+                            from sahi.predict import get_sliced_prediction
+                            _br = get_sliced_prediction(
+                                crop,
+                                _sahi_ball,
+                                slice_height=BALL_SAHI_SLICE,
+                                slice_width=BALL_SAHI_SLICE,
+                                overlap_height_ratio=BALL_SAHI_OVERLAP,
+                                overlap_width_ratio=BALL_SAHI_OVERLAP,
+                                verbose=0,
+                            )
+                            _bpreds = [
+                                o for o in _br.object_prediction_list
+                                if o.score.value >= ball_conf
+                                and (ball_dedicated or o.category.id == ball_class_id)
+                            ]
+                            if _bpreds:
+                                _best = max(_bpreds, key=lambda o: o.score.value)
+                                _bb = _best.bbox
+                                bc_x = float(np.clip((_bb.minx+_bb.maxx)/2, 0, img_w-1))
+                                bc_y = float(np.clip((_bb.miny+_bb.maxy)/2+(y_top if pitch_ok else 0), 0, img_h-1))
+                                ball_candidate = (bc_x, bc_y, float(_best.score.value))
+                        else:
+                            # Broadcast mode: direct inference with correct class id
+                            _ball_classes = None if ball_dedicated else [ball_class_id]
+                            ball_results, ball_half = _run_yolo(
+                                ball_model,
+                                ball_half,
+                                source=infer_frame,
+                                conf=ball_conf,
+                                iou=DET_IOU,
+                                classes=_ball_classes,
+                                imgsz=640,
+                                batch=1,
+                                device=device,
+                                verbose=False,
+                            )
+                            ball_boxes_obj = ball_results.boxes
+                            if ball_boxes_obj is not None and len(ball_boxes_obj) > 0:
+                                ball_boxes = ball_boxes_obj.xyxy.cpu().numpy()
+                                ball_confs = ball_boxes_obj.conf.cpu().numpy()
+                                # filter to ball class if not dedicated
+                                if not ball_dedicated:
+                                    _bc_mask = ball_boxes_obj.cls.cpu().numpy().astype(int) == ball_class_id
+                                    if _bc_mask.any():
+                                        ball_boxes = ball_boxes[_bc_mask]
+                                        ball_confs = ball_confs[_bc_mask]
+                                    else:
+                                        ball_boxes = np.empty((0, 4))
+                                if len(ball_boxes) > 0:
+                                    ball_boxes[:, [0, 2]] /= scale
+                                    ball_boxes[:, [1, 3]] /= scale
+                                    if pitch_ok:
+                                        ball_boxes[:, [1, 3]] += y_top
+                                    ball_boxes[:, [0, 2]] = np.clip(ball_boxes[:, [0, 2]], 0, img_w-1)
+                                    ball_boxes[:, [1, 3]] = np.clip(ball_boxes[:, [1, 3]], 0, img_h-1)
+                                    best_idx = int(np.argmax(ball_confs))
+                                    bx = ball_boxes[best_idx]
+                                    bc_x = float(np.clip((bx[0]+bx[2])/2, 0, img_w-1))
+                                    bc_y = float(np.clip((bx[1]+bx[3])/2, 0, img_h-1))
+                                    ball_candidate = (bc_x, bc_y, float(ball_confs[best_idx]))
 
                     tracked = tracker.update(player_dets)
                     if tracked is not None and len(tracked) > 0:
@@ -456,9 +647,17 @@ if video_path:
 
                     if idx % 5 == 0:
                         track_progress(idx, frames_to_run, time.time() - t0)
+                        # Proactively free GPU memory every 5 frames
+                        if device == "cuda":
+                            torch.cuda.empty_cache()
                     idx += 1
 
             cap.release()
+            # free last frame tensors (player_results only exists in broadcast path)
+            try:
+                del infer_frame, player_results
+            except NameError:
+                pass
             # RTX3060
             inference_seconds = max(time.time() - t0, 1e-6)
             # RTX3060
@@ -673,18 +872,31 @@ if st.session_state.get("analysis_done"):
         st.markdown("---")
         st.subheader("🎬 Render Annotated Video")
 
-        if st.session_state.get("vid_bytes"):
-            st.success(f"Video ready: {st.session_state['vid_filename']}")
-            st.download_button(
-                label="⬇️ Download rendered video",
-                data=st.session_state["vid_bytes"],
-                file_name=st.session_state["vid_filename"],
-                mime="video/mp4",
-                key="dl_btn_cached",
-            )
+        rendered_path = st.session_state.get("rendered_video_path")
+        rendered_name = st.session_state.get("rendered_video_name")
+        if rendered_path and os.path.exists(str(rendered_path)):
+            if not rendered_name:
+                rendered_name = Path(rendered_path).name
+            size_mb = os.path.getsize(rendered_path) / (1024 * 1024)
+            st.success(f"Video ready: {rendered_name} ({size_mb:.1f} MB)")
+            if size_mb <= MAX_RENDER_DOWNLOAD_MB:
+                with open(rendered_path, "rb") as vf:
+                    st.download_button(
+                        label="⬇️ Download rendered video",
+                        data=vf,
+                        file_name=rendered_name,
+                        mime="video/mp4",
+                        key="dl_btn_rendered",
+                    )
+            else:
+                st.warning(
+                    f"Rendered video is {size_mb:.1f} MB. "
+                    "Use the file path below to copy it manually."
+                )
+                st.code(str(rendered_path))
             if st.button("🔄 Re-render video", key="rerender_btn"):
-                st.session_state["vid_bytes"]    = None
-                st.session_state["vid_filename"] = None
+                st.session_state["rendered_video_path"] = None
+                st.session_state["rendered_video_name"] = None
                 st.rerun()
         else:
             if _video_path and os.path.exists(str(_video_path)):
@@ -698,10 +910,8 @@ if st.session_state.get("analysis_done"):
                             _video_path, tracks_df, (ball_df if ball_df is not None else pd.DataFrame()),
                             poss_df, frames_run, _fps, vname,
                             H, H_inv, attacking_team, enable_triangle)
-                        with open(vid_path, "rb") as vf:
-                            vid_bytes = vf.read()
-                        st.session_state["vid_bytes"]    = vid_bytes
-                        st.session_state["vid_filename"] = f"{vname}_final.mp4"
+                        st.session_state["rendered_video_path"] = str(vid_path)
+                        st.session_state["rendered_video_name"] = f"{vname}_final.mp4"
                     st.rerun()
             else:
                 st.info("Original video not available for rendering.")
@@ -751,7 +961,13 @@ if st.session_state.get("analysis_done"):
             - SORT discards low-confidence detections → more ID switches
             """)
             from src.evaluation import compare_trackers
-            comp_df, fig_comp = compare_trackers(tracks_df, sort_df, sort_reid_df, "", frames_run)
+            # Gap 4: pass GT file if uploaded — enables real MOTA/IDF1 metrics
+            _gt_file_for_eval = _gt_path if _gt_path and os.path.exists(_gt_path) else ""
+            if _gt_file_for_eval:
+                st.info(f"📋 Computing MOTA/IDF1 with uploaded GT file")
+            else:
+                st.caption("Upload a GT .txt file in the sidebar to see MOTA/IDF1 metrics.")
+            comp_df, fig_comp = compare_trackers(tracks_df, sort_df, sort_reid_df, _gt_file_for_eval, frames_run)
             st.dataframe(comp_df, use_container_width=True)
             st.pyplot(fig_comp)
             if not reid_available:

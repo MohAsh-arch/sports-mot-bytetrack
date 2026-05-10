@@ -50,20 +50,31 @@ def find_overlapping_ids(tracks_df, frame_idx, thresh=OVERLAP_IOU_THRESH):
                 overlapping.add(ids[i]); overlapping.add(ids[j])
     return overlapping
 
+# Gap 3 fix: 15 crops per track gives much better KMeans centroids than 5,
+# while still being far fewer disk reads than the full notebook (all frames).
+_MAX_CROPS_PER_ID = 15
+
 def classify_teams(tracks_df, video_path, progress_cb=None):
     """
     Overlap-aware team classification.
-    1. Build per-ID features from non-overlapping frames
+    1. Build per-ID features from non-overlapping frames (sampled, ≤ _MAX_CROPS_PER_ID per ID)
     2. Average features per ID
     3. KMeans on clean features
     4. Assign all tracks via nearest centroid
     Returns (tracks_df with 'team' column, team_map dict).
     """
+    # ── Sample at most _MAX_CROPS_PER_ID frames per track to limit memory ──────
+    sampled_rows = []
+    for tid, grp in tracks_df.groupby("track_id"):
+        step = max(1, len(grp) // _MAX_CROPS_PER_ID)
+        sampled_rows.append(grp.iloc[::step].head(_MAX_CROPS_PER_ID))
+    sample_df = pd.concat(sampled_rows, ignore_index=True)
+
     cap = cv2.VideoCapture(str(video_path))
     per_id_feats = defaultdict(list)
 
     prev_fidx = -1; cur_frame = None
-    frame_groups = sorted(tracks_df.groupby("frame"), key=lambda x: x[0])
+    frame_groups = sorted(sample_df.groupby("frame"), key=lambda x: x[0])
     total_frames = len(frame_groups)
 
     for idx, (fidx, group) in enumerate(frame_groups):
@@ -84,17 +95,22 @@ def classify_teams(tracks_df, video_path, progress_cb=None):
 
         for _, row in group.iterrows():
             tid = int(row["track_id"])
-            if tid in overlapping:
+            if tid in overlapping or len(per_id_feats[tid]) >= _MAX_CROPS_PER_ID:
                 continue
             feat = extract_jersey_feature(cur_frame, row["x1"], row["y1"],
                                           row["x2"], row["y2"])
             if feat is not None:
                 per_id_feats[tid].append(feat)
 
+        # Release frame reference to allow GC
+        if idx % 10 == 0:
+            cur_frame = None  # noqa
+
         if progress_cb and idx % 20 == 0:
             progress_cb(idx, total_frames, 0)
 
     cap.release()
+    del sample_df, frame_groups
 
     valid_ids = []
     features = []

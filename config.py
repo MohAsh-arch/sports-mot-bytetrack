@@ -96,7 +96,7 @@ BALL_SAHI_OVERLAP = 0.2
 BALL_COCO_CLASS_ID = 32           # fallback: COCO "sports ball"
 
 # Kalman gate filter for ball
-MAX_BALL_JUMP   = 120             # px — reject ghost detections > this
+MAX_BALL_JUMP   = 300             # px — reject ghost detections > this
 
 # ── Re-ID (SORT augmentation) ─────────────────
 REID_ALPHA = 0.4
