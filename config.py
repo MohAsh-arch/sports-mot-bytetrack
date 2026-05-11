@@ -87,6 +87,11 @@ BALL_MODEL_URL  = (
     "https://huggingface.co/SkalskiP/sports.cv/"
     "resolve/main/football-ball-detection.pt"
 )
+# Fallback URLs to try if primary download fails (401/403)
+BALL_MODEL_URL_FALLBACKS = [
+    "https://github.com/roboflow/sports/raw/main/data/football-ball-detection.pt",
+    "https://media.roboflow.com/football-ball-detection.pt",
+]
 BALL_MODEL_PATH = MODELS_DIR / "ball_detector.pt"
 BALL_CONF       = 0.10
 BALL_CONF_DEDICATED = 0.25
@@ -94,9 +99,10 @@ BALL_IOU        = 0.45
 BALL_SAHI_SLICE = 320
 BALL_SAHI_OVERLAP = 0.2
 BALL_COCO_CLASS_ID = 32           # fallback: COCO "sports ball"
+BALL_DETECT_ON_FULL_RES = True    # always run ball detection on full-res frame
 
-# Kalman gate filter for ball
-MAX_BALL_JUMP   = 300             # px — reject ghost detections > this
+# Kalman gate filter for ball — notebook uses 120 to aggressively reject ghost dots
+MAX_BALL_JUMP   = 120             # px — reject ghost detections > this (was 300, notebook=120)
 
 # ── Re-ID (SORT augmentation) ─────────────────
 REID_ALPHA = 0.4

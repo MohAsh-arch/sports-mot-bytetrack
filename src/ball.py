@@ -12,7 +12,8 @@ from filterpy.kalman import KalmanFilter as KF
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
-    DEVICE, BALL_MODEL_URL, BALL_MODEL_PATH, BALL_CONF, BALL_CONF_DEDICATED, BALL_IOU,
+    DEVICE, BALL_MODEL_URL, BALL_MODEL_URL_FALLBACKS, BALL_MODEL_PATH,
+    BALL_CONF, BALL_CONF_DEDICATED, BALL_IOU,
     BALL_SAHI_SLICE, BALL_SAHI_OVERLAP, BALL_COCO_CLASS_ID, MAX_BALL_JUMP,
 )
 
@@ -34,9 +35,12 @@ class BallKalmanGate:
     def update(self, cx, cy):
         """Returns True if accepted, False if ghost rejected."""
         if not self.initialized:
+            # Seed the filter with the first detection (matches notebook Cell 5)
             self.kf.x = np.array([[cx],[cy],[0],[0]], dtype=float)
             self.initialized = True
+            self.kf.update(np.array([[cx],[cy]], dtype=float))
             return True
+        # Predict THEN gate-check (notebook order: predict → distance → accept/reject)
         self.kf.predict()
         pred = self.kf.x[:2].flatten()
         dist = np.linalg.norm(np.array([cx, cy]) - pred)
@@ -46,11 +50,15 @@ class BallKalmanGate:
         return False  # Ghost dot rejected
 
     def get_predicted(self):
-        """Get current predicted position."""
+        """Get current predicted position without advancing the filter state.
+        Uses a copy to avoid double-predict drift on skipped frames."""
         if not self.initialized:
             return None
-        self.kf.predict()
-        return self.kf.x[:2].flatten()
+        # Return prediction without mutating internal state
+        # (avoid calling self.kf.predict() which would advance state)
+        F = self.kf.F
+        predicted_x = F @ self.kf.x
+        return predicted_x[:2].flatten()
 
 class BallDetector:
     """
@@ -98,14 +106,25 @@ class BallDetector:
     def _ensure_ball_model(self):
         if BALL_MODEL_PATH.exists():
             return True
-        try:
-            print("Downloading dedicated ball detection model...")
-            BALL_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-            urllib.request.urlretrieve(BALL_MODEL_URL, str(BALL_MODEL_PATH))
-            return True
-        except Exception as e:
-            print(f"Could not download ball model: {e}")
-            return False
+        # Try primary URL, then fallbacks
+        urls_to_try = [BALL_MODEL_URL] + BALL_MODEL_URL_FALLBACKS
+        BALL_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        for url in urls_to_try:
+            try:
+                print(f"Downloading dedicated ball detection model from {url}...")
+                urllib.request.urlretrieve(url, str(BALL_MODEL_PATH))
+                # Verify the file is a valid model (not an HTML error page)
+                if BALL_MODEL_PATH.stat().st_size > 1_000_000:  # >1MB = likely valid
+                    print(f"  Downloaded → {BALL_MODEL_PATH}")
+                    return True
+                else:
+                    print(f"  Downloaded file too small ({BALL_MODEL_PATH.stat().st_size} bytes), trying next URL")
+                    BALL_MODEL_PATH.unlink(missing_ok=True)
+            except Exception as e:
+                print(f"  Failed from {url}: {e}")
+                BALL_MODEL_PATH.unlink(missing_ok=True)
+        print("Could not download ball model from any URL — using COCO fallback")
+        return False
 
     def detect_frame(self, frame):
         """

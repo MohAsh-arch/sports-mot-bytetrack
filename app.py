@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore")
 # RTX3060 — 640 keeps both models in 6 GB VRAM simultaneously
 INFERENCE_WIDTH = 640
 # RTX3060
-BALL_DETECT_EVERY = 2
+BALL_DETECT_EVERY = 1  # match notebook: detect every frame for best accuracy
 # RTX3060
 GPU_VRAM_MB = 6144
 MAX_RENDER_DOWNLOAD_MB = 200
@@ -75,7 +75,8 @@ def load_models(device):
     import torch, urllib.request
     from ultralytics import YOLO
     from config import (
-        BALL_MODEL_URL, BALL_MODEL_PATH, BALL_CONF, BALL_CONF_DEDICATED, BALL_COCO_CLASS_ID
+        BALL_MODEL_URL, BALL_MODEL_URL_FALLBACKS, BALL_MODEL_PATH,
+        BALL_CONF, BALL_CONF_DEDICATED, BALL_COCO_CLASS_ID
     )
 
     player_model = YOLO("yolov8m.pt").to(device)
@@ -83,12 +84,21 @@ def load_models(device):
     # ── Gap 1: try dedicated fine-tuned football-ball-detection.pt ──────────────
     ball_dedicated = False
     if not BALL_MODEL_PATH.exists():
-        try:
-            BALL_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-            urllib.request.urlretrieve(BALL_MODEL_URL, str(BALL_MODEL_PATH))
-            ball_dedicated = True
-        except Exception as _e:
-            print(f"Ball model download failed ({_e}), using COCO fallback")
+        # Try primary URL, then fallbacks
+        urls_to_try = [BALL_MODEL_URL] + BALL_MODEL_URL_FALLBACKS
+        for url in urls_to_try:
+            try:
+                BALL_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+                urllib.request.urlretrieve(url, str(BALL_MODEL_PATH))
+                # Verify the file is valid (not an HTML error page)
+                if BALL_MODEL_PATH.stat().st_size > 1_000_000:
+                    ball_dedicated = True
+                    break
+                else:
+                    BALL_MODEL_PATH.unlink(missing_ok=True)
+            except Exception as _e:
+                BALL_MODEL_PATH.unlink(missing_ok=True)
+                print(f"Ball model download failed from {url}: ({_e})")
     else:
         ball_dedicated = True
 
@@ -545,11 +555,16 @@ if video_path:
                     # ── Gap 1: ball detection using dedicated model + correct class/conf ─
                     ball_candidate = None
                     if enable_ball and idx % ball_detect_every == 0:
+                        # ── CRITICAL FIX: detect ball on FULL-RESOLUTION frame ──
+                        # The notebook (Cell 5) runs SAHI on the full frame because
+                        # the ball is tiny (8-15px panoramic, 20-40px broadcast).
+                        # Downscaling to 640px makes it 1-3px → undetectable.
+                        ball_detect_frame = frame  # full resolution, not crop/infer_frame
                         if _sahi_ball is not None:
                             # Use SAHI slicing for small ball in ALL footage (panoramic and broadcast)
                             from sahi.predict import get_sliced_prediction
                             _br = get_sliced_prediction(
-                                crop,
+                                ball_detect_frame,
                                 _sahi_ball,
                                 slice_height=BALL_SAHI_SLICE,
                                 slice_width=BALL_SAHI_SLICE,
@@ -565,16 +580,17 @@ if video_path:
                             if _bpreds:
                                 _best = max(_bpreds, key=lambda o: o.score.value)
                                 _bb = _best.bbox
+                                # No y_top offset needed — we're using full frame
                                 bc_x = float(np.clip((_bb.minx+_bb.maxx)/2, 0, img_w-1))
-                                bc_y = float(np.clip((_bb.miny+_bb.maxy)/2+(y_top if pitch_ok else 0), 0, img_h-1))
+                                bc_y = float(np.clip((_bb.miny+_bb.maxy)/2, 0, img_h-1))
                                 ball_candidate = (bc_x, bc_y, float(_best.score.value))
                         else:
-                            # Broadcast mode: direct inference with correct class id
+                            # Direct inference on full-resolution frame (not downscaled)
                             _ball_classes = None if ball_dedicated else [ball_class_id]
                             ball_results, ball_half = _run_yolo(
                                 ball_model,
                                 ball_half,
-                                source=infer_frame,
+                                source=ball_detect_frame,
                                 conf=ball_conf,
                                 iou=DET_IOU,
                                 classes=_ball_classes,
@@ -596,10 +612,7 @@ if video_path:
                                     else:
                                         ball_boxes = np.empty((0, 4))
                                 if len(ball_boxes) > 0:
-                                    ball_boxes[:, [0, 2]] /= scale
-                                    ball_boxes[:, [1, 3]] /= scale
-                                    if pitch_ok:
-                                        ball_boxes[:, [1, 3]] += y_top
+                                    # No rescaling needed — inference was on full frame
                                     ball_boxes[:, [0, 2]] = np.clip(ball_boxes[:, [0, 2]], 0, img_w-1)
                                     ball_boxes[:, [1, 3]] = np.clip(ball_boxes[:, [1, 3]], 0, img_h-1)
                                     best_idx = int(np.argmax(ball_confs))
@@ -635,6 +648,9 @@ if video_path:
                                     ball_row["cy"] = round(cy, 1)
                                     ball_row["conf"] = round(conf, 3)
                         else:
+                            # Skipped frame: use non-mutating prediction
+                            # (get_predicted now returns F@x without calling kf.predict,
+                            #  avoiding the double-predict drift bug)
                             pred = ball_gate.get_predicted()
                             if pred is not None:
                                 px = float(np.clip(pred[0], 0, img_w - 1))
